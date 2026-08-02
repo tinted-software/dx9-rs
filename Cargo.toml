@@ -1,0 +1,16 @@
+[package]
+name = "dx9-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+logos = { version = "0.14", default-features = false, features = ["export_derive"] }
+annotate-snippets = { version = "0.12.16", default-features = false }
+
+[dev-dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+[lib]
+name = "dx9_compiler"
+crate-type = ["staticlib", "rlib"]
