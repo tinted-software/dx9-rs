@@ -686,6 +686,11 @@ impl<'a> Parser<'a> {
             self.advance();
             return self.parse_primary_expr();
         }
+        if self.peek() == Some(&Token::Not) {
+            self.advance();
+            let expr = self.parse_primary_expr();
+            return Expr::FunctionCall("!".into(), vec![expr]);
+        }
         // prefix ++ / -- treated as no-op on the value (we just consume them)
         if matches!(self.peek(), Some(Token::PlusPlus) | Some(Token::MinusMinus)) {
             self.advance();

@@ -14,11 +14,17 @@ const OP_DP3: u32 = 8;
 const OP_DP4: u32 = 9;
 const OP_MIN: u32 = 10;
 const OP_MAX: u32 = 11;
+const OP_EXP: u32 = 14; // exp2 approx (D3DSIO_EXP)
+const OP_LOG: u32 = 15; // log2 approx (D3DSIO_LOG)
 const OP_LRP: u32 = 18; // lerp
+const OP_FRC: u32 = 19;
 const OP_M4X4: u32 = 20;
 const OP_M4X3: u32 = 21;
 const OP_M3X3: u32 = 23;
 const OP_DCL: u32 = 31; // D3DSIO_DCL (30 is D3DSIO_LABEL)
+const OP_POW: u32 = 32; // dest = src0 ^ src1
+const OP_ABS: u32 = 35;
+const OP_NRM: u32 = 36;
 const OP_TEX: u32 = 66; // TEXLD in PS 2.0+
 const OP_DEF: u32 = 81; // DEF c#, f,f,f,f
 const OP_TEXLDL: u32 = 95; // TEXLDL (explicit LOD in .w)
@@ -30,6 +36,10 @@ const WRITEMASK_W: u32 = 0x0008_0000;
 const WRITEMASK_XYZ: u32 = WRITEMASK_X | WRITEMASK_Y | WRITEMASK_Z;
 const WRITEMASK_XYZW: u32 = WRITEMASK_XYZ | WRITEMASK_W;
 const SWIZZLE_XYZW: u32 = 0x00E4_0000; // identity swizzle
+const SWIZZLE_XXXX: u32 = 0x0000_0000;
+const SWIZZLE_YYYY: u32 = 0x0055_0000;
+const SWIZZLE_ZZZZ: u32 = 0x00AA_0000;
+const SWIZZLE_WWWW: u32 = 0x00FF_0000;
 const TEXLD_PROJECT: u32 = 0x0001_0000; // D3DSI_TEXLD_PROJECT
 const TEXLD_BIAS: u32 = 0x0002_0000; // D3DSI_TEXLD_BIAS
 // D3DSTT_* in bits 27-30 of the dcl texture-type token
@@ -71,6 +81,48 @@ struct ResolvedRegister {
     index: u32,
 }
 
+/// Map HLSL swizzle/component names to a D3D9 source swizzle token.
+/// Scalar selectors (.r/.a/…) replicate into all four channels so `float`
+/// temps that conventionally live in `.x` still see the right value.
+fn swizzle_from_member(member: &str) -> Option<u32> {
+    match member {
+        "x" | "r" | "s" => Some(SWIZZLE_XXXX),
+        "y" | "g" | "t" => Some(SWIZZLE_YYYY),
+        "z" | "b" | "p" => Some(SWIZZLE_ZZZZ),
+        "w" | "a" | "q" => Some(SWIZZLE_WWWW),
+        "xy" | "rg" | "st" => Some(0x0044_0000), // XYXY
+        "zw" | "ba" | "pq" => Some(0x00EE_0000), // ZWZW
+        "xyz" | "rgb" | "stp" => Some(SWIZZLE_XYZW),
+        "xyzw" | "rgba" | "stpq" => Some(SWIZZLE_XYZW),
+        _ => None,
+    }
+}
+
+fn writemask_from_member(member: &str) -> Option<u32> {
+    match member {
+        "x" | "r" | "s" => Some(WRITEMASK_X),
+        "y" | "g" | "t" => Some(WRITEMASK_Y),
+        "z" | "b" | "p" => Some(WRITEMASK_Z),
+        "w" | "a" | "q" => Some(WRITEMASK_W),
+        "xy" | "rg" | "st" => Some(WRITEMASK_X | WRITEMASK_Y),
+        "zw" | "ba" | "pq" => Some(WRITEMASK_Z | WRITEMASK_W),
+        "xyz" | "rgb" | "stp" => Some(WRITEMASK_XYZ),
+        "xyzw" | "rgba" | "stpq" => Some(WRITEMASK_XYZW),
+        _ => None,
+    }
+}
+
+/// Source swizzle when writing a (possibly scalar) value into a masked dest.
+/// D3D feeds the Nth written channel from the Nth swizzle slot; for a lone
+/// `.w` write only the W slot matters, so XXXX puts src.x into dest.w.
+fn src_swizzle_for_writemask(mask: u32) -> u32 {
+    if mask == WRITEMASK_X || mask == WRITEMASK_Y || mask == WRITEMASK_Z || mask == WRITEMASK_W {
+        SWIZZLE_XXXX
+    } else {
+        SWIZZLE_XYZW
+    }
+}
+
 pub struct Codegen {
     bytecode: Vec<u32>,
     structs: HashMap<String, StructDef>,
@@ -79,6 +131,8 @@ pub struct Codegen {
     local_vars: HashMap<String, ResolvedRegister>,
     // Locals whose fields are bound directly to shader output registers
     output_struct_locals: HashMap<String, String>,
+    // Compile-time bools from `static const bool x = ...` (and similar)
+    const_bools: HashMap<String, bool>,
     // Next available temporary register index
     next_temp: u32,
     // High constant slots reserved for DEF immediates (avoid clobbering engine c0..)
@@ -95,8 +149,10 @@ impl Codegen {
             globals: HashMap::new(),
             local_vars: HashMap::new(),
             output_struct_locals: HashMap::new(),
+            const_bools: HashMap::new(),
             next_temp: 0,
-            next_def_const: 220,
+            // Set properly in compile() from is_pixel_shader — PS SM3 max is c223.
+            next_def_const: 240,
             matrix_consts: HashMap::new(),
         }
     }
@@ -110,6 +166,128 @@ impl Codegen {
         reg
     }
 
+    /// Resolve the register behind an lvalue (no swizzle materialization).
+    fn resolve_lvalue_register(&mut self, expr: &Expr) -> Option<ResolvedRegister> {
+        match expr {
+            Expr::Variable(name) => self.local_vars.get(name).cloned(),
+            Expr::MemberAccess(base, member) => {
+                if let Expr::Variable(base_name) = &**base {
+                    let key = format!("{}.{}", base_name, member);
+                    if let Some(reg) = self.local_vars.get(&key) {
+                        return Some(reg.clone());
+                    }
+                }
+                // Nested swizzle lvalue like `o.color.a` — strip the mask later.
+                self.resolve_lvalue_register(base)
+            }
+            _ => None,
+        }
+    }
+
+    /// `(register, writemask)` for assignments to `foo.a` / `bar.rgb` / etc.
+    fn resolve_masked_lvalue(&mut self, expr: &Expr) -> Option<(ResolvedRegister, u32)> {
+        match expr {
+            Expr::MemberAccess(base, member) => {
+                if let Some(mask) = writemask_from_member(member) {
+                    let reg = self.resolve_lvalue_register(base)?;
+                    return Some((reg, mask));
+                }
+                // `o.color` style struct field — full register write.
+                if let Expr::Variable(base_name) = &**base {
+                    let key = format!("{}.{}", base_name, member);
+                    if let Some(reg) = self.local_vars.get(&key) {
+                        return Some((reg.clone(), WRITEMASK_XYZW));
+                    }
+                }
+                None
+            }
+            Expr::Variable(name) => self
+                .local_vars
+                .get(name)
+                .cloned()
+                .map(|r| (r, WRITEMASK_XYZW)),
+            _ => None,
+        }
+    }
+
+    fn emit_assign_op(&mut self, op: Op, lhs: &Expr, rhs: &Expr) -> ResolvedRegister {
+        let r_reg = self.compile_expr(rhs);
+        if let Some((l_reg, mask)) = self.resolve_masked_lvalue(lhs) {
+            let src_swz = src_swizzle_for_writemask(mask);
+            match op {
+                Op::Assign => {
+                    self.emit_mov_masked(&l_reg, &r_reg, mask, src_swz);
+                }
+                Op::AddAssign | Op::SubAssign | Op::MulAssign | Op::DivAssign => {
+                    let opcode = match op {
+                        Op::AddAssign => OP_ADD,
+                        Op::SubAssign => OP_SUB,
+                        Op::MulAssign => OP_MUL,
+                        Op::DivAssign => OP_RCP, // handled below
+                        _ => unreachable!(),
+                    };
+                    if opcode == OP_RCP {
+                        // l.mask /= r  →  l.mask = l * rcp(r)
+                        let rcp_temp = self.alloc_temp();
+                        self.emit_instruction(OP_RCP, &rcp_temp, &[r_reg]);
+                        self.bytecode.push((3 << 24) | OP_MUL);
+                        self.bytecode.push(Self::encode_register(
+                            l_reg.reg_type,
+                            l_reg.index,
+                            mask,
+                        ));
+                        self.bytecode.push(Self::encode_register(
+                            l_reg.reg_type,
+                            l_reg.index,
+                            SWIZZLE_XYZW,
+                        ));
+                        self.bytecode.push(Self::encode_register(
+                            rcp_temp.reg_type,
+                            rcp_temp.index,
+                            src_swz,
+                        ));
+                    } else {
+                        self.bytecode.push((3 << 24) | opcode);
+                        self.bytecode.push(Self::encode_register(
+                            l_reg.reg_type,
+                            l_reg.index,
+                            mask,
+                        ));
+                        self.bytecode.push(Self::encode_register(
+                            l_reg.reg_type,
+                            l_reg.index,
+                            SWIZZLE_XYZW,
+                        ));
+                        self.bytecode.push(Self::encode_register(
+                            r_reg.reg_type,
+                            r_reg.index,
+                            src_swz,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            return l_reg;
+        }
+        // Fallback: whole-register ops (no known lvalue).
+        let l_reg = self.compile_expr(lhs);
+        if r_reg.reg_type != D3DSPR_SAMPLER && l_reg.reg_type != D3DSPR_SAMPLER {
+            match op {
+                Op::Assign => self.emit_instruction(OP_MOV, &l_reg, &[r_reg]),
+                Op::AddAssign => self.emit_instruction(OP_ADD, &l_reg, &[l_reg.clone(), r_reg]),
+                Op::SubAssign => self.emit_instruction(OP_SUB, &l_reg, &[l_reg.clone(), r_reg]),
+                Op::MulAssign => self.emit_instruction(OP_MUL, &l_reg, &[l_reg.clone(), r_reg]),
+                Op::DivAssign => {
+                    let rcp_temp = self.alloc_temp();
+                    self.emit_instruction(OP_RCP, &rcp_temp, &[r_reg]);
+                    self.emit_instruction(OP_MUL, &l_reg, &[l_reg.clone(), rcp_temp]);
+                }
+                _ => {}
+            }
+        }
+        l_reg
+    }
+
     fn encode_register(reg_type: u32, index: u32, write_mask_or_swizzle: u32) -> u32 {
         let mut token = 0x80000000;
         token |= (reg_type & 0x7) << 28;
@@ -117,6 +295,45 @@ impl Codegen {
         token |= index & 0x7FF;
         token |= write_mask_or_swizzle;
         token
+    }
+
+    /// Resolve a compile-time bool (static const, literals, simple logic).
+    /// Used so `if (g_bVertexColor)` doesn't emit both branches — that was
+    /// overwriting VGUI vertex color with DoLighting (alpha 0 → invisible).
+    fn eval_const_bool(&self, expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::LiteralBool(v) => Some(*v),
+            Expr::LiteralInt(v) => Some(*v != 0),
+            Expr::LiteralFloat(v) => Some(*v != 0.0),
+            Expr::Variable(name) => self.const_bools.get(name).copied(),
+            Expr::BinaryOp(lhs, Op::And, rhs) => {
+                Some(self.eval_const_bool(lhs)? && self.eval_const_bool(rhs)?)
+            }
+            Expr::BinaryOp(lhs, Op::Or, rhs) => {
+                Some(self.eval_const_bool(lhs)? || self.eval_const_bool(rhs)?)
+            }
+            Expr::Ternary(cond, t, e) => {
+                if self.eval_const_bool(cond)? {
+                    self.eval_const_bool(t)
+                } else {
+                    self.eval_const_bool(e)
+                }
+            }
+            Expr::Cast(_, inner) => self.eval_const_bool(inner),
+            // Unary `!` parsed as FunctionCall("!", [expr]) — see lexer Token::Not.
+            Expr::FunctionCall(name, args) if name == "!" && args.len() == 1 => {
+                self.eval_const_bool(&args[0]).map(|v| !v)
+            }
+            _ => None,
+        }
+    }
+
+    fn record_const_from_decl(&mut self, v: &VariableDecl) {
+        if let Some(init) = &v.initializer {
+            if let Some(b) = self.eval_const_bool(init) {
+                self.const_bools.insert(v.name.clone(), b);
+            }
+        }
     }
 
     /// Emit `def cN, x,y,z,w` and return that constant register.
@@ -136,6 +353,37 @@ impl Codegen {
         self.bytecode.push(z.to_bits());
         self.bytecode.push(w.to_bits());
         dest
+    }
+
+    /// If every arg is a numeric literal, emit one `def` instead of N defs + movs.
+    fn try_def_literal_construct(&mut self, args: &[Expr]) -> Option<ResolvedRegister> {
+        if args.is_empty() || args.len() > 4 {
+            return None;
+        }
+        let mut comps = [0.0f32; 4];
+        for (i, arg) in args.iter().enumerate() {
+            comps[i] = match arg {
+                Expr::LiteralFloat(v) => *v,
+                Expr::LiteralInt(v) => *v as f32,
+                Expr::LiteralBool(v) => {
+                    if *v {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => return None,
+            };
+        }
+        // Splat last component into unused channels (matches HLSL scalar→vector feel
+        // for partial vectors; float4(1,1,1,1) fills all four explicitly).
+        if args.len() < 4 {
+            let last = comps[args.len() - 1];
+            for c in &mut comps[args.len()..] {
+                *c = last;
+            }
+        }
+        Some(self.def_const(comps[0], comps[1], comps[2], comps[3]))
     }
 
     fn emit_mov_masked(
@@ -290,6 +538,13 @@ impl Codegen {
     }
 
     pub fn compile(mut self, ast: &ShaderAST, is_pixel_shader: bool) -> Vec<u32> {
+        // DEF immediates must stay inside the stage's float-const limit:
+        //   VS SM3: c0–c255 (MaxFloatConstantsVS = 256)
+        //   PS SM3: c0–c223 (MaxSM3FloatConstantsPS = 224)
+        // Engine shader-specific VS consts go through ~c224; shared PS consts
+        // are low (≤~c31). Use the high end of each legal range.
+        self.next_def_const = if is_pixel_shader { 200 } else { 240 };
+
         // 1. Gather structs and globals
         for def in &ast.definitions {
             match def {
@@ -297,6 +552,7 @@ impl Codegen {
                     self.structs.insert(s.name.clone(), s.clone());
                 }
                 Definition::Variable(v) => {
+                    self.record_const_from_decl(v);
                     self.globals.insert(v.name.clone(), v.clone());
                 }
                 _ => {}
@@ -489,6 +745,7 @@ impl Codegen {
     fn compile_stmt(&mut self, stmt: &Stmt, output_mapping: &HashMap<String, ResolvedRegister>) {
         match stmt {
             Stmt::VariableDecl(v) => {
+                self.record_const_from_decl(v);
                 // `VS_OUT o;` — bind o.field to temporaries. Flushing to real
                 // o# / oC# registers happens on `return o` so mid-shader reads
                 // of `o.field` stay legal (SM3 outputs are write-only).
@@ -552,11 +809,19 @@ impl Codegen {
                 }
             }
             Stmt::If(cond, then_branch, else_branch) => {
-                // Compile standard IF statement
-                self.compile_expr(cond);
-                self.compile_stmt(then_branch, output_mapping);
-                if let Some(eb) = else_branch {
-                    self.compile_stmt(eb, output_mapping);
+                // Fold compile-time conditions so static combo branches don't
+                // both execute (last write wins and corrupts outputs).
+                match self.eval_const_bool(cond) {
+                    Some(true) => self.compile_stmt(then_branch, output_mapping),
+                    Some(false) => {
+                        if let Some(eb) = else_branch {
+                            self.compile_stmt(eb, output_mapping);
+                        }
+                    }
+                    None => {
+                        // No real branching yet — skip rather than emit both
+                        // (dual-write) or then-only (wrong for `if (!flag)`).
+                    }
                 }
             }
             Stmt::For(init, cond, post, body) => {
@@ -601,51 +866,59 @@ impl Codegen {
                 if member == "__index" {
                     return self.compile_expr(base);
                 }
+                // Struct field binding (e.g. o.color → dedicated temp).
                 if let Expr::Variable(base_name) = &**base {
                     let key = format!("{}.{}", base_name, member);
                     if let Some(reg) = self.local_vars.get(&key) {
                         return reg.clone();
                     }
                 }
-                self.compile_expr(base)
+                let reg = self.compile_expr(base);
+                // Materialize swizzles into a temp. Without this, `baseColor.a`
+                // was ignored and `alpha *= baseColor.a` became `alpha *= baseColor.r`
+                // — white glyph RGB made every covered texel fully opaque (solid
+                // rectangle characters).
+                if let Some(swz) = swizzle_from_member(member) {
+                    let dest = self.alloc_temp();
+                    self.emit_mov_masked(&dest, &reg, WRITEMASK_XYZW, swz);
+                    return dest;
+                }
+                reg
             }
             Expr::BinaryOp(lhs, op, rhs) => {
                 if matches!(
                     op,
                     Op::Assign | Op::AddAssign | Op::SubAssign | Op::MulAssign | Op::DivAssign
                 ) {
-                    let r_reg = self.compile_expr(rhs);
-                    let l_reg = self.compile_expr(lhs);
-                    if r_reg.reg_type != D3DSPR_SAMPLER && l_reg.reg_type != D3DSPR_SAMPLER {
-                        self.emit_instruction(OP_MOV, &l_reg, &[r_reg]);
-                    }
-                    l_reg
-                } else {
-                    let l_reg = self.compile_expr(lhs);
-                    let r_reg = self.compile_expr(rhs);
-                    if l_reg.reg_type == D3DSPR_SAMPLER || r_reg.reg_type == D3DSPR_SAMPLER {
-                        return self.alloc_temp();
-                    }
-                    let dest = self.alloc_temp();
-                    let opcode = match op {
-                        Op::Add => OP_ADD,
-                        Op::Sub => OP_SUB,
-                        Op::Mul => OP_MUL,
-                        Op::Div => OP_RCP,
-                        Op::Assign => unreachable!(),
-                        _ => OP_ADD,
-                    };
-                    if opcode == OP_RCP {
-                        let rcp_temp = self.alloc_temp();
-                        self.emit_instruction(OP_RCP, &rcp_temp, &[r_reg]);
-                        self.emit_instruction(OP_MUL, &dest, &[l_reg, rcp_temp]);
-                    } else {
-                        self.emit_instruction(opcode, &dest, &[l_reg, r_reg]);
-                    }
-                    dest
+                    return self.emit_assign_op(op.clone(), lhs, rhs);
                 }
+                let l_reg = self.compile_expr(lhs);
+                let r_reg = self.compile_expr(rhs);
+                if l_reg.reg_type == D3DSPR_SAMPLER || r_reg.reg_type == D3DSPR_SAMPLER {
+                    return self.alloc_temp();
+                }
+                let dest = self.alloc_temp();
+                let opcode = match op {
+                    Op::Add => OP_ADD,
+                    Op::Sub => OP_SUB,
+                    Op::Mul => OP_MUL,
+                    Op::Div => OP_RCP,
+                    Op::Assign => unreachable!(),
+                    _ => OP_ADD,
+                };
+                if opcode == OP_RCP {
+                    let rcp_temp = self.alloc_temp();
+                    self.emit_instruction(OP_RCP, &rcp_temp, &[r_reg]);
+                    self.emit_instruction(OP_MUL, &dest, &[l_reg, rcp_temp]);
+                } else {
+                    self.emit_instruction(opcode, &dest, &[l_reg, r_reg]);
+                }
+                dest
             }
             Expr::Construct(_, args) => {
+                if let Some(lit) = self.try_def_literal_construct(args) {
+                    return lit;
+                }
                 let dest = self.alloc_temp();
                 if args.is_empty() {
                     return dest;
@@ -731,16 +1004,112 @@ impl Codegen {
                         let f = self.compile_expr(&args[2]);
                         self.emit_instruction(OP_LRP, &dest, &[f, b, a]);
                     }
-                    // SkinPosition(..., out worldPos): use non-skinned mul4x3(pos, cModel[0])
+                    // VGUI UnlitGeneric does GammaToLinear via pow(c, 2.2). Without
+                    // this, unknown intrinsics fall through to MOV and sRGB write
+                    // washes midtones into flat medium grays.
+                    "pow" if args.len() == 2 => {
+                        let base = self.compile_expr(&args[0]);
+                        let exp = self.compile_expr(&args[1]);
+                        self.emit_pow(&dest, &base, &exp);
+                    }
+                    // common_fxc.h helpers — dx9-rs does not yet expand user
+                    // functions, so treat these as intrinsics (pow). Match
+                    // float4 overloads: convert .xyz only, preserve .w (alpha).
+                    // Applying pow to alpha crushed font coverage to 1px stems.
+                    "GammaToLinear" if args.len() == 1 => {
+                        let base = self.compile_expr(&args[0]);
+                        let exp = self.def_const(2.2, 2.2, 2.2, 2.2);
+                        self.emit_pow_rgb_preserve_alpha(&dest, &base, &exp);
+                    }
+                    "LinearToGamma" if args.len() == 1 => {
+                        let base = self.compile_expr(&args[0]);
+                        let exp = self.def_const(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2);
+                        self.emit_pow_rgb_preserve_alpha(&dest, &base, &exp);
+                    }
+                    "log" | "log2" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        self.emit_instruction(OP_LOG, &dest, &[src]);
+                    }
+                    "exp" | "exp2" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        self.emit_instruction(OP_EXP, &dest, &[src]);
+                    }
+                    "rsqrt" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        self.emit_instruction(OP_RSQ, &dest, &[src]);
+                    }
+                    "rcp" | "rcp_safe" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        self.emit_instruction(OP_RCP, &dest, &[src]);
+                    }
+                    "sqrt" if args.len() == 1 => {
+                        // D3D9 has no SQRT — rsq then rcp.
+                        let src = self.compile_expr(&args[0]);
+                        let tmp = self.alloc_temp();
+                        self.emit_instruction(OP_RSQ, &tmp, &[src]);
+                        self.emit_instruction(OP_RCP, &dest, &[tmp]);
+                    }
+                    "abs" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        self.emit_instruction(OP_ABS, &dest, &[src]);
+                    }
+                    "frac" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        self.emit_instruction(OP_FRC, &dest, &[src]);
+                    }
+                    "normalize" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        self.emit_instruction(OP_NRM, &dest, &[src]);
+                    }
+                    "saturate" if args.len() == 1 => {
+                        let src = self.compile_expr(&args[0]);
+                        let one = self.def_const(1.0, 1.0, 1.0, 1.0);
+                        let zero = self.def_const(0.0, 0.0, 0.0, 0.0);
+                        let tmp = self.alloc_temp();
+                        self.emit_instruction(OP_MIN, &tmp, &[src, one]);
+                        self.emit_instruction(OP_MAX, &dest, &[tmp, zero]);
+                    }
+                    "min" if args.len() == 2 => {
+                        let a = self.compile_expr(&args[0]);
+                        let b = self.compile_expr(&args[1]);
+                        self.emit_instruction(OP_MIN, &dest, &[a, b]);
+                    }
+                    "max" if args.len() == 2 => {
+                        let a = self.compile_expr(&args[0]);
+                        let b = self.compile_expr(&args[1]);
+                        self.emit_instruction(OP_MAX, &dest, &[a, b]);
+                    }
+                    // SkinPosition* non-skinned path is mul4x3(pos, cModel[0]).
+                    // VGUI (and most UnlitGeneric) uses SkinPositionAndNormal;
+                    // if cModel isn't committed the m4x3 yields zeros and every
+                    // quad collapses → magenta clear only. Mov through for now;
+                    // real skinning lands once we compile these properly.
                     "SkinPosition" if args.len() >= 5 => {
                         let pos = self.compile_expr(&args[1]);
                         let out = self.compile_expr(&args[4]);
-                        if let Some(cmodel) = self.local_vars.get("cModel").cloned() {
-                            self.emit_instruction(OP_M4X3, &out, &[pos, cmodel]);
-                        } else {
-                            self.emit_instruction(OP_MOV, &out, &[pos]);
-                        }
+                        self.emit_instruction(OP_MOV, &out, &[pos]);
                         return out;
+                    }
+                    "SkinPositionAndNormal" if args.len() >= 7 => {
+                        let pos = self.compile_expr(&args[1]);
+                        let normal = self.compile_expr(&args[2]);
+                        let out_pos = self.compile_expr(&args[5]);
+                        let out_n = self.compile_expr(&args[6]);
+                        self.emit_instruction(OP_MOV, &out_pos, &[pos]);
+                        self.emit_instruction(OP_MOV, &out_n, &[normal]);
+                        return out_pos;
+                    }
+                    "SkinPositionNormalAndTangentSpace" if args.len() >= 9 => {
+                        let pos = self.compile_expr(&args[1]);
+                        let normal = self.compile_expr(&args[2]);
+                        let tangent = self.compile_expr(&args[3]);
+                        let out_pos = self.compile_expr(&args[6]);
+                        let out_n = self.compile_expr(&args[7]);
+                        let out_t = self.compile_expr(&args[8]);
+                        self.emit_instruction(OP_MOV, &out_pos, &[pos]);
+                        self.emit_instruction(OP_MOV, &out_n, &[normal]);
+                        self.emit_instruction(OP_MOV, &out_t, &[tangent]);
+                        return out_pos;
                     }
                     "tex2D" | "texCUBE" | "tex3D" if args.len() == 2 => {
                         let sampler = self.compile_expr(&args[0]);
@@ -775,17 +1144,12 @@ impl Codegen {
             }
             Expr::Cast(_, base) => self.compile_expr(base),
             Expr::Ternary(cond, then_expr, else_expr) => {
-                match &**cond {
-                    Expr::LiteralInt(0) | Expr::LiteralBool(false) => {
-                        return self.compile_expr(else_expr);
-                    }
-                    Expr::LiteralFloat(v) if *v == 0.0 => {
-                        return self.compile_expr(else_expr);
-                    }
-                    Expr::LiteralInt(n) if *n != 0 => return self.compile_expr(then_expr),
-                    Expr::LiteralBool(true) => return self.compile_expr(then_expr),
-                    Expr::LiteralFloat(f) if *f != 0.0 => return self.compile_expr(then_expr),
-                    _ => {}
+                if let Some(b) = self.eval_const_bool(cond) {
+                    return if b {
+                        self.compile_expr(then_expr)
+                    } else {
+                        self.compile_expr(else_expr)
+                    };
                 }
                 self.compile_expr(cond);
                 let t_reg = self.compile_expr(then_expr);
@@ -808,6 +1172,67 @@ impl Codegen {
         sources: &[ResolvedRegister],
     ) {
         self.emit_instruction_flags(opcode, dest, sources);
+    }
+
+    /// D3D9 `pow` is scalar (DXVK requires replicate swizzles and only uses .x).
+    /// Emit one POW per component so `pow(float3, 2.2)` works.
+    fn emit_pow(
+        &mut self,
+        dest: &ResolvedRegister,
+        base: &ResolvedRegister,
+        exp: &ResolvedRegister,
+    ) {
+        let comps = [
+            (WRITEMASK_X, SWIZZLE_XXXX),
+            (WRITEMASK_Y, SWIZZLE_YYYY),
+            (WRITEMASK_Z, SWIZZLE_ZZZZ),
+            (WRITEMASK_W, SWIZZLE_WWWW),
+        ];
+        for (mask, swizzle) in comps {
+            self.bytecode.push((3 << 24) | OP_POW);
+            self.bytecode
+                .push(Self::encode_register(dest.reg_type, dest.index, mask));
+            self.bytecode
+                .push(Self::encode_register(base.reg_type, base.index, swizzle));
+            // Exponent is almost always a scalar constant — replicate .x
+            self.bytecode
+                .push(Self::encode_register(exp.reg_type, exp.index, SWIZZLE_XXXX));
+        }
+    }
+
+    /// Like `emit_pow`, but only on .xyz; .w is copied (common_fxc.h GammaToLinear).
+    fn emit_pow_rgb_preserve_alpha(
+        &mut self,
+        dest: &ResolvedRegister,
+        base: &ResolvedRegister,
+        exp: &ResolvedRegister,
+    ) {
+        let comps = [
+            (WRITEMASK_X, SWIZZLE_XXXX),
+            (WRITEMASK_Y, SWIZZLE_YYYY),
+            (WRITEMASK_Z, SWIZZLE_ZZZZ),
+        ];
+        for (mask, swizzle) in comps {
+            self.bytecode.push((3 << 24) | OP_POW);
+            self.bytecode
+                .push(Self::encode_register(dest.reg_type, dest.index, mask));
+            self.bytecode
+                .push(Self::encode_register(base.reg_type, base.index, swizzle));
+            self.bytecode
+                .push(Self::encode_register(exp.reg_type, exp.index, SWIZZLE_XXXX));
+        }
+        // dest.w = base.w
+        self.bytecode.push((2 << 24) | OP_MOV);
+        self.bytecode.push(Self::encode_register(
+            dest.reg_type,
+            dest.index,
+            WRITEMASK_W,
+        ));
+        self.bytecode.push(Self::encode_register(
+            base.reg_type,
+            base.index,
+            SWIZZLE_WWWW,
+        ));
     }
 
     fn emit_instruction_flags(

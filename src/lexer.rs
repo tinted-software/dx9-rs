@@ -151,6 +151,8 @@ pub enum Token {
     Equal,
     #[token("!=")]
     NotEqual,
+    #[token("!")]
+    Not,
     #[token("&&")]
     And,
     #[token("||")]
