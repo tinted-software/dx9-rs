@@ -3,3 +3,4 @@ target/
 /subprojects/*
 !/subprojects/*.wrap
 !/subprojects/packagefiles
+.pi/
