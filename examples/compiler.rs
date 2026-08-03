@@ -66,3 +66,6 @@ fn main() {
         binary_data.len()
     );
 }
+
+#[cfg(test)]
+mod t {}

@@ -15,6 +15,7 @@ pkg = cargo_ws.package('dx9-rs')
 dx9_compiler = pkg.library('dx9_compiler', rust_abi: 'c', install: true)
 
 dx9_compiler_dep = declare_dependency(link_with: dx9_compiler)
+meson.override_dependency('dx9_compiler', dx9_compiler_dep)
 meson.override_dependency('dx9-rs', dx9_compiler_dep)
 
 pkgconfig.generate(
