@@ -21,6 +21,8 @@ pub enum DataType {
     Half4,
     Sampler,
     Sampler2D,
+    Sampler3D,
+    SamplerCUBE,
     UserType(String),
 }
 

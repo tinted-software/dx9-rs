@@ -14,9 +14,16 @@ const OP_DP3: u32 = 8;
 const OP_DP4: u32 = 9;
 const OP_MIN: u32 = 10;
 const OP_MAX: u32 = 11;
-const OP_DCL: u32 = 30;
+const OP_DCL: u32 = 31; // D3DSIO_DCL (30 is D3DSIO_LABEL)
 const OP_TEX: u32 = 66; // TEXLD in PS 2.0+
+const OP_TEXLDL: u32 = 95; // TEXLDL (explicit LOD in .w)
 const OP_END: u32 = 0x0000FFFF;
+const TEXLD_PROJECT: u32 = 0x0001_0000; // D3DSI_TEXLD_PROJECT
+const TEXLD_BIAS: u32 = 0x0002_0000; // D3DSI_TEXLD_BIAS
+// D3DSTT_* in bits 27-30 of the dcl texture-type token
+const D3DSTT_2D: u32 = 2;
+const D3DSTT_CUBE: u32 = 3;
+const D3DSTT_VOLUME: u32 = 4;
 
 // D3D9 Register Types (D3DSHADER_PARAM_REGISTER_TYPE)
 const D3DSPR_TEMP: u32 = 0; // r#
@@ -262,11 +269,23 @@ impl Codegen {
                         );
                     }
                     RegisterType::Sampler(idx) => {
-                        // Sampler declaration instruction
+                        // Sampler declaration: dcl_2d / dcl_cube / dcl_volume s#
                         let reg_token =
                             Self::encode_register(D3DSPR_SAMPLER, *idx as u32, 0x000F0000);
+                        let tex_ty = match var.data_type {
+                            DataType::SamplerCUBE => D3DSTT_CUBE,
+                            DataType::Sampler3D => D3DSTT_VOLUME,
+                            DataType::UserType(ref n) if n.eq_ignore_ascii_case("samplercube") => {
+                                D3DSTT_CUBE
+                            }
+                            DataType::UserType(ref n) if n.eq_ignore_ascii_case("sampler3d") => {
+                                D3DSTT_VOLUME
+                            }
+                            _ => D3DSTT_2D,
+                        };
+                        let dcl_texture_type = 0x80000000 | (tex_ty << 27);
                         self.bytecode.push((2 << 24) | OP_DCL);
-                        self.bytecode.push(0x80000000); // Default sampler type
+                        self.bytecode.push(dcl_texture_type);
                         self.bytecode.push(reg_token);
 
                         self.local_vars.insert(
@@ -326,15 +345,17 @@ impl Codegen {
     fn compile_stmt(&mut self, stmt: &Stmt, output_mapping: &HashMap<String, ResolvedRegister>) {
         match stmt {
             Stmt::VariableDecl(v) => {
-                // `VS_OUT o;` — bind o.field to the declared SM3 output registers so
-                // assignments like `o.pos = ...` write o# / oC# directly.
+                // `VS_OUT o;` — bind o.field to temporaries. Flushing to real
+                // o# / oC# registers happens on `return o` so mid-shader reads
+                // of `o.field` stay legal (SM3 outputs are write-only).
                 if let DataType::UserType(struct_name) = &v.data_type {
                     if let Some(s_def) = self.structs.get(struct_name).cloned() {
                         let mut bound = false;
                         for field in &s_def.fields {
-                            if let Some(out_reg) = output_mapping.get(&field.name) {
+                            if output_mapping.contains_key(&field.name) {
                                 let key = format!("{}.{}", v.name, field.name);
-                                self.local_vars.insert(key, out_reg.clone());
+                                let temp = self.alloc_temp();
+                                self.local_vars.insert(key, temp);
                                 bound = true;
                             }
                         }
@@ -358,9 +379,20 @@ impl Codegen {
             }
             Stmt::Return(expr_opt) => {
                 if let Some(expr) = expr_opt {
-                    // Returning an output struct local: fields were already written to o#/oC#.
+                    // Returning an output struct local: copy field temps → o#/oC#.
                     if let Expr::Variable(name) = expr {
-                        if self.output_struct_locals.contains_key(name) {
+                        if let Some(struct_name) = self.output_struct_locals.get(name).cloned() {
+                            if let Some(s_def) = self.structs.get(&struct_name).cloned() {
+                                for field in &s_def.fields {
+                                    let key = format!("{}.{}", name, field.name);
+                                    if let (Some(src), Some(dst)) = (
+                                        self.local_vars.get(&key).cloned(),
+                                        output_mapping.get(&field.name),
+                                    ) {
+                                        self.emit_instruction(OP_MOV, dst, &[src]);
+                                    }
+                                }
+                            }
                             return;
                         }
                     }
@@ -441,6 +473,9 @@ impl Codegen {
                 } else {
                     let l_reg = self.compile_expr(lhs);
                     let r_reg = self.compile_expr(rhs);
+                    if l_reg.reg_type == D3DSPR_SAMPLER || r_reg.reg_type == D3DSPR_SAMPLER {
+                        return self.alloc_temp();
+                    }
                     let dest = self.alloc_temp();
                     let opcode = match op {
                         Op::Add => OP_ADD,
@@ -465,7 +500,9 @@ impl Codegen {
                 let dest = self.alloc_temp();
                 if !args.is_empty() {
                     let src = self.compile_expr(&args[0]);
-                    self.emit_instruction(OP_MOV, &dest, &[src]);
+                    if src.reg_type != D3DSPR_SAMPLER {
+                        self.emit_instruction(OP_MOV, &dest, &[src]);
+                    }
                 }
                 dest
             }
@@ -478,16 +515,35 @@ impl Codegen {
                         // Matrix multiply can be implemented as series of DP4/DP3 instructions
                         self.emit_instruction(OP_DP4, &dest, &[a, b]);
                     }
-                    "tex2D" if args.len() == 2 => {
+                    // tex2D / texCUBE / tex3D → texld dest, coord, s#
+                    "tex2D" | "texCUBE" | "tex3D" if args.len() == 2 => {
                         let sampler = self.compile_expr(&args[0]);
                         let uv = self.compile_expr(&args[1]);
-                        // texld dest, uv, sampler
                         self.emit_instruction(OP_TEX, &dest, &[uv, sampler]);
                     }
+                    "tex2Dproj" | "texCUBEproj" | "tex3Dproj" if args.len() == 2 => {
+                        let sampler = self.compile_expr(&args[0]);
+                        let uv = self.compile_expr(&args[1]);
+                        self.emit_instruction_flags(OP_TEX | TEXLD_PROJECT, &dest, &[uv, sampler]);
+                    }
+                    "tex2Dbias" | "texCUBEbias" | "tex3Dbias" if args.len() == 2 => {
+                        let sampler = self.compile_expr(&args[0]);
+                        let uv = self.compile_expr(&args[1]);
+                        self.emit_instruction_flags(OP_TEX | TEXLD_BIAS, &dest, &[uv, sampler]);
+                    }
+                    // tex*lod → texldl (LOD in .w of coord)
+                    "tex2Dlod" | "texCUBElod" | "tex3Dlod" if args.len() == 2 => {
+                        let sampler = self.compile_expr(&args[0]);
+                        let uv = self.compile_expr(&args[1]);
+                        self.emit_instruction(OP_TEXLDL, &dest, &[uv, sampler]);
+                    }
                     _ => {
+                        // Never emit ALU/mov with a sampler source — DXVK cannot load s#.
                         if !args.is_empty() {
                             let src = self.compile_expr(&args[0]);
-                            self.emit_instruction(OP_MOV, &dest, &[src]);
+                            if src.reg_type != D3DSPR_SAMPLER {
+                                self.emit_instruction(OP_MOV, &dest, &[src]);
+                            }
                         }
                     }
                 }
@@ -515,8 +571,17 @@ impl Codegen {
         dest: &ResolvedRegister,
         sources: &[ResolvedRegister],
     ) {
+        self.emit_instruction_flags(opcode, dest, sources);
+    }
+
+    fn emit_instruction_flags(
+        &mut self,
+        opcode_and_flags: u32,
+        dest: &ResolvedRegister,
+        sources: &[ResolvedRegister],
+    ) {
         let size = 1 + sources.len() as u32; // dest + sources
-        let inst_token = (size << 24) | opcode;
+        let inst_token = (size << 24) | opcode_and_flags;
         self.bytecode.push(inst_token);
 
         // Dest register token (all channels write mask 0x000F0000 by default)

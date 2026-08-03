@@ -94,7 +94,13 @@ pub unsafe extern "C" fn compile_dx9_shader(
             }
         };
         let mut parser = Parser::new(&preprocessed, "ffi_shader.hlsl");
-        let ast = parser.parse();
+        let ast = match parser.try_parse() {
+            Ok(ast) => ast,
+            Err(e) => {
+                eprintln!("dx9-rs parse error: {e}");
+                return Err(-1);
+            }
+        };
         let codegen = Codegen::new();
         let is_ps = is_pixel
             || options
@@ -121,7 +127,10 @@ pub unsafe extern "C" fn compile_dx9_shader(
             0
         }
         Ok(Err(code)) => code,
-        Err(_) => -2,
+        Err(_) => {
+            eprintln!("dx9-rs: internal panic during compile");
+            -2
+        }
     }
 }
 

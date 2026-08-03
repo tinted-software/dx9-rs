@@ -12,6 +12,8 @@ pub enum Token {
     Const,
     #[token("static")]
     Static,
+    #[token("uniform")]
+    Uniform,
     #[token("register")]
     Register,
     #[token("return")]
@@ -58,6 +60,10 @@ pub enum Token {
     Sampler,
     #[token("sampler2D")]
     Sampler2D,
+    #[token("sampler3D")]
+    Sampler3D,
+    #[token("samplerCUBE")]
+    SamplerCUBE,
     #[token("true")]
     True,
     #[token("false")]
@@ -77,22 +83,23 @@ pub enum Token {
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Identifier(String),
 
-    // Literals
-    #[regex(r"[0-9]+\.[0-9]*[fF]?", |lex| {
+    // Literals — HLSL allows 1.0f, .5, 1e-5, 1.5E+3f, 1f
+    #[regex(r"([0-9]+\.[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?[fF]?|[0-9]+[eE][+-]?[0-9]+[fF]?|[0-9]+[fF]", |lex| {
         let s = lex.slice();
         let s = s.strip_suffix('f').or_else(|| s.strip_suffix('F')).unwrap_or(s);
         s.parse::<f32>().ok()
     })]
     FloatLiteral(f32),
 
-    #[regex(r"\.[0-9]+[fF]?", |lex| {
+    #[regex(r"[0-9]+", |lex| {
         let s = lex.slice();
-        let s = s.strip_suffix('f').or_else(|| s.strip_suffix('F')).unwrap_or(s);
-        format!("0{}", s).parse::<f32>().ok()
+        s.parse::<i32>().ok().or_else(|| {
+            // Oversized integer constants (hashes etc.) — clamp into i32.
+            s.parse::<i64>()
+                .ok()
+                .map(|v| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+        })
     })]
-    FloatLiteralNoLeadingZero(f32),
-
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i32>().ok())]
     IntLiteral(i32),
 
     // Preprocessor line

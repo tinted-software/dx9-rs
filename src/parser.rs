@@ -81,16 +81,35 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse(&mut self) -> ShaderAST {
-        let mut definitions = Vec::new();
-        while self.pos < self.tokens.len() {
-            if let Some(Token::Preprocessor(content)) = self.peek() {
-                definitions.push(Definition::Preprocessor(content.clone()));
-                self.advance();
-                continue;
+        self.try_parse().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible entry point for FFI — never unwinds past this frame on parse errors.
+    pub fn try_parse(&mut self) -> Result<ShaderAST, String> {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut definitions = Vec::new();
+            while self.pos < self.tokens.len() {
+                if let Some(Token::Preprocessor(content)) = self.peek() {
+                    definitions.push(Definition::Preprocessor(content.clone()));
+                    self.advance();
+                    continue;
+                }
+                definitions.push(self.parse_definition());
             }
-            definitions.push(self.parse_definition());
-        }
-        ShaderAST { definitions }
+            ShaderAST { definitions }
+        }));
+        std::panic::set_hook(prev_hook);
+        result.map_err(|payload| {
+            if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else {
+                "parse error".to_string()
+            }
+        })
     }
 
     fn parse_definition(&mut self) -> Definition {
@@ -228,6 +247,8 @@ impl<'a> Parser<'a> {
             Some(Token::Half4) => DataType::Half4,
             Some(Token::Sampler) => DataType::Sampler,
             Some(Token::Sampler2D) => DataType::Sampler2D,
+            Some(Token::Sampler3D) => DataType::Sampler3D,
+            Some(Token::SamplerCUBE) => DataType::SamplerCUBE,
             Some(Token::Identifier(id)) => DataType::UserType(id),
             _ => self.error("Expected data type", span, "invalid type"),
         }
@@ -293,17 +314,21 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if self.peek() != Some(&Token::RParen) {
             loop {
-                let is_const = if self.peek() == Some(&Token::Const) {
-                    self.advance();
-                    true
-                } else {
-                    false
-                };
-                if let Some(Token::Identifier(id)) = self.peek()
-                    && (id == "in" || id == "out" || id == "inout")
-                {
-                    self.advance();
+                // Skip parameter modifiers: const / uniform / in / out / inout
+                loop {
+                    match self.peek() {
+                        Some(Token::Const) | Some(Token::Uniform) => {
+                            self.advance();
+                        }
+                        Some(Token::Identifier(id))
+                            if id == "in" || id == "out" || id == "inout" || id == "uniform" =>
+                        {
+                            self.advance();
+                        }
+                        _ => break,
+                    }
                 }
+                let is_const = false;
                 let data_type = self.parse_data_type();
                 let param_name_span = self.peek_span();
                 let param_name = match self.advance() {
@@ -314,6 +339,13 @@ impl<'a> Parser<'a> {
                         "expected parameter name here",
                     ),
                 };
+
+                // HLSL array params: `float3 cAmbientCube[6]`
+                if self.peek() == Some(&Token::LBracket) {
+                    self.advance();
+                    self.advance(); // size (literal or identifier)
+                    self.expect(Token::RBracket, "Expected ']' after array size");
+                }
 
                 let semantic = if self.peek() == Some(&Token::Colon) {
                     self.advance();
@@ -336,6 +368,12 @@ impl<'a> Parser<'a> {
                     semantic,
                     is_const,
                 });
+
+                // HLSL default arguments: `bool b = false`, `float z = 1.0f`
+                if self.peek() == Some(&Token::Assign) {
+                    self.advance();
+                    let _default = self.parse_expr();
+                }
 
                 if self.peek() == Some(&Token::Comma) {
                     self.advance();
@@ -637,10 +675,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary_expr(&mut self) -> Expr {
+        // Unary +/-/! and prefix ++/--
         if self.peek() == Some(&Token::Minus) {
             self.advance(); // consume '-'
             let expr = self.parse_primary_expr();
             return Expr::BinaryOp(Box::new(Expr::LiteralFloat(0.0)), Op::Sub, Box::new(expr));
+        }
+        if self.peek() == Some(&Token::Plus) {
+            // Unary plus (also covers `+ +x` from macro expansion)
+            self.advance();
+            return self.parse_primary_expr();
         }
         // prefix ++ / -- treated as no-op on the value (we just consume them)
         if matches!(self.peek(), Some(Token::PlusPlus) | Some(Token::MinusMinus)) {
@@ -650,7 +694,6 @@ impl<'a> Parser<'a> {
         let span = self.peek_span();
         let mut expr = match self.advance() {
             Some(Token::FloatLiteral(f)) => Expr::LiteralFloat(f),
-            Some(Token::FloatLiteralNoLeadingZero(f)) => Expr::LiteralFloat(f),
             Some(Token::IntLiteral(i)) => Expr::LiteralInt(i),
             Some(Token::True) => Expr::LiteralBool(true),
             Some(Token::False) => Expr::LiteralBool(false),
@@ -765,12 +808,12 @@ impl<'a> Parser<'a> {
                                 after,
                                 Some(Token::Identifier(_))
                                     | Some(Token::FloatLiteral(_))
-                                    | Some(Token::FloatLiteralNoLeadingZero(_))
                                     | Some(Token::IntLiteral(_))
                                     | Some(Token::True)
                                     | Some(Token::False)
                                     | Some(Token::LParen)
                                     | Some(Token::Minus)
+                                    | Some(Token::Plus)
                                     | Some(Token::Float)
                                     | Some(Token::Float2)
                                     | Some(Token::Float3)
@@ -859,13 +902,13 @@ impl<'a> Parser<'a> {
         matches!(
             self.peek(),
             Some(Token::FloatLiteral(_))
-                | Some(Token::FloatLiteralNoLeadingZero(_))
                 | Some(Token::IntLiteral(_))
                 | Some(Token::True)
                 | Some(Token::False)
                 | Some(Token::Identifier(_))
                 | Some(Token::LParen)
                 | Some(Token::Minus)
+                | Some(Token::Plus)
                 | Some(Token::Float)
                 | Some(Token::Float2)
                 | Some(Token::Float3)
