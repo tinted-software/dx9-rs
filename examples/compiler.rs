@@ -1,6 +1,7 @@
 use clap::Parser as ClapParser;
 use dx9_compiler::codegen::Codegen;
 use dx9_compiler::parser::Parser;
+use dx9_compiler::preprocess::{PreprocessOptions, preprocess};
 use std::fs;
 use std::path::PathBuf;
 
@@ -21,6 +22,10 @@ struct Args {
     /// Compile as pixel shader (default is vertex shader)
     #[arg(short, long)]
     pixel: bool,
+
+    /// Extra -DNAME[=VALUE] macros
+    #[arg(short = 'D', long = "define", value_name = "NAME[=VALUE]")]
+    defines: Vec<String>,
 }
 
 fn main() {
@@ -35,6 +40,35 @@ fn main() {
     };
 
     let is_pixel_shader = args.pixel || args.input.to_string_lossy().contains("_ps");
+
+    let mut options = PreprocessOptions::default();
+    if let Some(parent) = args.input.parent() {
+        options.include_dirs.push(parent.to_path_buf());
+    }
+    if is_pixel_shader {
+        options
+            .defines
+            .insert("SHADER_MODEL_PS_3_0".into(), "1".into());
+    } else {
+        options
+            .defines
+            .insert("SHADER_MODEL_VS_3_0".into(), "1".into());
+    }
+    for def in &args.defines {
+        if let Some((name, value)) = def.split_once('=') {
+            options.defines.insert(name.to_string(), value.to_string());
+        } else {
+            options.defines.insert(def.clone(), "1".into());
+        }
+    }
+
+    let source = match preprocess(&source, &options) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Preprocess error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let filename_str = args.input.to_string_lossy();
     let mut parser = Parser::new(&source, &filename_str);
@@ -66,6 +100,3 @@ fn main() {
         binary_data.len()
     );
 }
-
-#[cfg(test)]
-mod t {}

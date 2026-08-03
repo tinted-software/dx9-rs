@@ -301,11 +301,10 @@ impl Codegen {
                 }
             }
             _ => {
-                let semantic = main_func.return_semantic.as_deref().unwrap_or(if is_pixel_shader {
-                    "COLOR"
-                } else {
-                    "POSITION"
-                });
+                let semantic = main_func
+                    .return_semantic
+                    .as_deref()
+                    .unwrap_or(if is_pixel_shader { "COLOR" } else { "POSITION" });
                 let out_reg =
                     self.map_output_register(semantic, is_pixel_shader, &mut output_reg_idx);
                 self.emit_output_dcl(&out_reg, semantic, is_pixel_shader);
