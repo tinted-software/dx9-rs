@@ -14,10 +14,22 @@ const OP_DP3: u32 = 8;
 const OP_DP4: u32 = 9;
 const OP_MIN: u32 = 10;
 const OP_MAX: u32 = 11;
+const OP_LRP: u32 = 18; // lerp
+const OP_M4X4: u32 = 20;
+const OP_M4X3: u32 = 21;
+const OP_M3X3: u32 = 23;
 const OP_DCL: u32 = 31; // D3DSIO_DCL (30 is D3DSIO_LABEL)
 const OP_TEX: u32 = 66; // TEXLD in PS 2.0+
+const OP_DEF: u32 = 81; // DEF c#, f,f,f,f
 const OP_TEXLDL: u32 = 95; // TEXLDL (explicit LOD in .w)
 const OP_END: u32 = 0x0000FFFF;
+const WRITEMASK_X: u32 = 0x0001_0000;
+const WRITEMASK_Y: u32 = 0x0002_0000;
+const WRITEMASK_Z: u32 = 0x0004_0000;
+const WRITEMASK_W: u32 = 0x0008_0000;
+const WRITEMASK_XYZ: u32 = WRITEMASK_X | WRITEMASK_Y | WRITEMASK_Z;
+const WRITEMASK_XYZW: u32 = WRITEMASK_XYZ | WRITEMASK_W;
+const SWIZZLE_XYZW: u32 = 0x00E4_0000; // identity swizzle
 const TEXLD_PROJECT: u32 = 0x0001_0000; // D3DSI_TEXLD_PROJECT
 const TEXLD_BIAS: u32 = 0x0002_0000; // D3DSI_TEXLD_BIAS
 // D3DSTT_* in bits 27-30 of the dcl texture-type token
@@ -69,6 +81,10 @@ pub struct Codegen {
     output_struct_locals: HashMap<String, String>,
     // Next available temporary register index
     next_temp: u32,
+    // High constant slots reserved for DEF immediates (avoid clobbering engine c0..)
+    next_def_const: u32,
+    // Matrix-typed constant registers (base index → rows: 4=float4x4, 3=float4x3/float3x3)
+    matrix_consts: HashMap<u32, u32>,
 }
 
 impl Codegen {
@@ -80,6 +96,8 @@ impl Codegen {
             local_vars: HashMap::new(),
             output_struct_locals: HashMap::new(),
             next_temp: 0,
+            next_def_const: 220,
+            matrix_consts: HashMap::new(),
         }
     }
 
@@ -99,6 +117,47 @@ impl Codegen {
         token |= index & 0x7FF;
         token |= write_mask_or_swizzle;
         token
+    }
+
+    /// Emit `def cN, x,y,z,w` and return that constant register.
+    fn def_const(&mut self, x: f32, y: f32, z: f32, w: f32) -> ResolvedRegister {
+        let idx = self.next_def_const;
+        self.next_def_const += 1;
+        let dest = ResolvedRegister {
+            reg_type: D3DSPR_CONST,
+            index: idx,
+        };
+        // DEF length = 5 (dest + 4 float immediates)
+        self.bytecode.push((5 << 24) | OP_DEF);
+        self.bytecode
+            .push(Self::encode_register(D3DSPR_CONST, idx, WRITEMASK_XYZW));
+        self.bytecode.push(x.to_bits());
+        self.bytecode.push(y.to_bits());
+        self.bytecode.push(z.to_bits());
+        self.bytecode.push(w.to_bits());
+        dest
+    }
+
+    fn emit_mov_masked(
+        &mut self,
+        dest: &ResolvedRegister,
+        src: &ResolvedRegister,
+        dest_mask: u32,
+        src_swizzle: u32,
+    ) {
+        self.bytecode.push((2 << 24) | OP_MOV);
+        self.bytecode
+            .push(Self::encode_register(dest.reg_type, dest.index, dest_mask));
+        self.bytecode
+            .push(Self::encode_register(src.reg_type, src.index, src_swizzle));
+    }
+
+    fn is_matrix_const(&self, reg: &ResolvedRegister) -> Option<u32> {
+        if reg.reg_type == D3DSPR_CONST {
+            self.matrix_consts.get(&reg.index).copied()
+        } else {
+            None
+        }
     }
 
     /// Map an HLSL output semantic to the SM3 destination register.
@@ -260,13 +319,25 @@ impl Codegen {
             if let Some(reg) = &var.register {
                 match reg {
                     RegisterType::ConstantFloat(idx) => {
+                        let idx = *idx as u32;
                         self.local_vars.insert(
                             name.clone(),
                             ResolvedRegister {
                                 reg_type: D3DSPR_CONST,
-                                index: *idx as u32,
+                                index: idx,
                             },
                         );
+                        let rows = match var.data_type {
+                            DataType::Float4x4 => Some(4u32),
+                            DataType::Float4x3 | DataType::Float3x3 | DataType::Float3x4 => {
+                                Some(3u32)
+                            }
+                            DataType::Float2x2 => Some(2u32),
+                            _ => None,
+                        };
+                        if let Some(r) = rows {
+                            self.matrix_consts.insert(idx, r);
+                        }
                     }
                     RegisterType::Sampler(idx) => {
                         // Sampler declaration: dcl_2d / dcl_cube / dcl_volume s#
@@ -437,22 +508,26 @@ impl Codegen {
 
     fn compile_expr(&mut self, expr: &Expr) -> ResolvedRegister {
         match expr {
-            Expr::LiteralFloat(_) | Expr::LiteralInt(_) | Expr::LiteralBool(_) => {
-                // Allocate a constant/temp to hold literals, or return a fake temp register
-                let temp = self.alloc_temp();
-                // D3D9 literal definitions are usually done via DEF instruction, but for simplicty,
-                // we can map to temp.
-                temp
+            Expr::LiteralFloat(v) => self.def_const(*v, *v, *v, *v),
+            Expr::LiteralInt(v) => {
+                let f = *v as f32;
+                self.def_const(f, f, f, f)
+            }
+            Expr::LiteralBool(v) => {
+                let f = if *v { 1.0 } else { 0.0 };
+                self.def_const(f, f, f, f)
             }
             Expr::Variable(name) => {
                 if let Some(reg) = self.local_vars.get(name) {
                     reg.clone()
                 } else {
-                    // Fallback to temp
                     self.alloc_temp()
                 }
             }
             Expr::MemberAccess(base, member) => {
+                if member == "__index" {
+                    return self.compile_expr(base);
+                }
                 if let Expr::Variable(base_name) = &**base {
                     let key = format!("{}.{}", base_name, member);
                     if let Some(reg) = self.local_vars.get(&key) {
@@ -468,7 +543,9 @@ impl Codegen {
                 ) {
                     let r_reg = self.compile_expr(rhs);
                     let l_reg = self.compile_expr(lhs);
-                    self.emit_instruction(OP_MOV, &l_reg, &[r_reg]);
+                    if r_reg.reg_type != D3DSPR_SAMPLER && l_reg.reg_type != D3DSPR_SAMPLER {
+                        self.emit_instruction(OP_MOV, &l_reg, &[r_reg]);
+                    }
                     l_reg
                 } else {
                     let l_reg = self.compile_expr(lhs);
@@ -481,7 +558,7 @@ impl Codegen {
                         Op::Add => OP_ADD,
                         Op::Sub => OP_SUB,
                         Op::Mul => OP_MUL,
-                        Op::Div => OP_RCP, // RCP is reciprocal, Div can be implemented via RCP + MUL
+                        Op::Div => OP_RCP,
                         Op::Assign => unreachable!(),
                         _ => OP_ADD,
                     };
@@ -496,12 +573,34 @@ impl Codegen {
                 }
             }
             Expr::Construct(_, args) => {
-                // Construct a vector. Allocate temp and move/evaluate arguments.
                 let dest = self.alloc_temp();
-                if !args.is_empty() {
+                if args.is_empty() {
+                    return dest;
+                }
+                if args.len() == 1 {
                     let src = self.compile_expr(&args[0]);
                     if src.reg_type != D3DSPR_SAMPLER {
                         self.emit_instruction(OP_MOV, &dest, &[src]);
+                    }
+                    return dest;
+                }
+                // float4(vec3, scalar) — common for clip-space transforms
+                if args.len() == 2 {
+                    let a = self.compile_expr(&args[0]);
+                    let b = self.compile_expr(&args[1]);
+                    if a.reg_type != D3DSPR_SAMPLER {
+                        self.emit_mov_masked(&dest, &a, WRITEMASK_XYZ, SWIZZLE_XYZW);
+                    }
+                    if b.reg_type != D3DSPR_SAMPLER {
+                        self.emit_mov_masked(&dest, &b, WRITEMASK_W, 0x0000_0000);
+                    }
+                    return dest;
+                }
+                let masks = [WRITEMASK_X, WRITEMASK_Y, WRITEMASK_Z, WRITEMASK_W];
+                for (i, arg) in args.iter().take(4).enumerate() {
+                    let src = self.compile_expr(arg);
+                    if src.reg_type != D3DSPR_SAMPLER {
+                        self.emit_mov_masked(&dest, &src, masks[i], 0x0000_0000);
                     }
                 }
                 dest
@@ -512,10 +611,49 @@ impl Codegen {
                     "mul" if args.len() == 2 => {
                         let a = self.compile_expr(&args[0]);
                         let b = self.compile_expr(&args[1]);
-                        // Matrix multiply can be implemented as series of DP4/DP3 instructions
+                        if let Some(rows) = self.is_matrix_const(&b) {
+                            let op = if rows >= 4 { OP_M4X4 } else { OP_M4X3 };
+                            self.emit_instruction(op, &dest, &[a, b]);
+                        } else if let Some(rows) = self.is_matrix_const(&a) {
+                            let op = if rows >= 4 { OP_M4X4 } else { OP_M4X3 };
+                            self.emit_instruction(op, &dest, &[b, a]);
+                        } else {
+                            self.emit_instruction(OP_MUL, &dest, &[a, b]);
+                        }
+                    }
+                    "mul4x3" if args.len() == 2 => {
+                        let v = self.compile_expr(&args[0]);
+                        let m = self.compile_expr(&args[1]);
+                        self.emit_instruction(OP_M4X3, &dest, &[v, m]);
+                    }
+                    "mul3x3" if args.len() == 2 => {
+                        let v = self.compile_expr(&args[0]);
+                        let m = self.compile_expr(&args[1]);
+                        self.emit_instruction(OP_M3X3, &dest, &[v, m]);
+                    }
+                    "dot" if args.len() == 2 => {
+                        let a = self.compile_expr(&args[0]);
+                        let b = self.compile_expr(&args[1]);
                         self.emit_instruction(OP_DP4, &dest, &[a, b]);
                     }
-                    // tex2D / texCUBE / tex3D → texld dest, coord, s#
+                    "lerp" if args.len() == 3 => {
+                        // HLSL lerp(a,b,f) == D3D LRP dest, f, b, a
+                        let a = self.compile_expr(&args[0]);
+                        let b = self.compile_expr(&args[1]);
+                        let f = self.compile_expr(&args[2]);
+                        self.emit_instruction(OP_LRP, &dest, &[f, b, a]);
+                    }
+                    // SkinPosition(..., out worldPos): use non-skinned mul4x3(pos, cModel[0])
+                    "SkinPosition" if args.len() >= 5 => {
+                        let pos = self.compile_expr(&args[1]);
+                        let out = self.compile_expr(&args[4]);
+                        if let Some(cmodel) = self.local_vars.get("cModel").cloned() {
+                            self.emit_instruction(OP_M4X3, &out, &[pos, cmodel]);
+                        } else {
+                            self.emit_instruction(OP_MOV, &out, &[pos]);
+                        }
+                        return out;
+                    }
                     "tex2D" | "texCUBE" | "tex3D" if args.len() == 2 => {
                         let sampler = self.compile_expr(&args[0]);
                         let uv = self.compile_expr(&args[1]);
@@ -531,14 +669,12 @@ impl Codegen {
                         let uv = self.compile_expr(&args[1]);
                         self.emit_instruction_flags(OP_TEX | TEXLD_BIAS, &dest, &[uv, sampler]);
                     }
-                    // tex*lod → texldl (LOD in .w of coord)
                     "tex2Dlod" | "texCUBElod" | "tex3Dlod" if args.len() == 2 => {
                         let sampler = self.compile_expr(&args[0]);
                         let uv = self.compile_expr(&args[1]);
                         self.emit_instruction(OP_TEXLDL, &dest, &[uv, sampler]);
                     }
                     _ => {
-                        // Never emit ALU/mov with a sampler source — DXVK cannot load s#.
                         if !args.is_empty() {
                             let src = self.compile_expr(&args[0]);
                             if src.reg_type != D3DSPR_SAMPLER {
@@ -551,6 +687,18 @@ impl Codegen {
             }
             Expr::Cast(_, base) => self.compile_expr(base),
             Expr::Ternary(cond, then_expr, else_expr) => {
+                match &**cond {
+                    Expr::LiteralInt(0) | Expr::LiteralBool(false) => {
+                        return self.compile_expr(else_expr);
+                    }
+                    Expr::LiteralFloat(v) if *v == 0.0 => {
+                        return self.compile_expr(else_expr);
+                    }
+                    Expr::LiteralInt(n) if *n != 0 => return self.compile_expr(then_expr),
+                    Expr::LiteralBool(true) => return self.compile_expr(then_expr),
+                    Expr::LiteralFloat(f) if *f != 0.0 => return self.compile_expr(then_expr),
+                    _ => {}
+                }
                 self.compile_expr(cond);
                 let t_reg = self.compile_expr(then_expr);
                 self.compile_expr(else_expr);
