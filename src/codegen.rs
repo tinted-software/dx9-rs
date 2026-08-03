@@ -160,6 +160,79 @@ impl Codegen {
         }
     }
 
+    /// Rows for a matrix-typed expression (including casts like `(float2x4)cTex`).
+    fn matrix_rows_of_expr(&self, expr: &Expr) -> Option<u32> {
+        match expr {
+            Expr::Cast(dt, inner) => match dt {
+                DataType::Float4x4 => Some(4),
+                DataType::Float4x3 | DataType::Float3x3 | DataType::Float3x4 => Some(3),
+                DataType::Float2x2 => Some(2),
+                DataType::UserType(n)
+                    if n.eq_ignore_ascii_case("float2x4") || n.eq_ignore_ascii_case("float2x3") =>
+                {
+                    Some(2)
+                }
+                DataType::UserType(n) if n.eq_ignore_ascii_case("float3x4") => Some(3),
+                // Cast of unknown type: peek at inner register matrix map
+                _ => self.matrix_rows_of_expr(inner),
+            },
+            Expr::Variable(name) => {
+                if let Some(reg) = self.local_vars.get(name) {
+                    if let Some(rows) = self.is_matrix_const(reg) {
+                        return Some(rows);
+                    }
+                }
+                if let Some(g) = self.globals.get(name) {
+                    return match g.data_type {
+                        DataType::Float4x4 => Some(4),
+                        DataType::Float4x3 | DataType::Float3x3 | DataType::Float3x4 => Some(3),
+                        DataType::Float2x2 => Some(2),
+                        _ => None,
+                    };
+                }
+                None
+            }
+            Expr::MemberAccess(base, member) if member == "__index" => {
+                self.matrix_rows_of_expr(base)
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_dp4_masked(
+        &mut self,
+        dest: &ResolvedRegister,
+        a: &ResolvedRegister,
+        b: &ResolvedRegister,
+        dest_mask: u32,
+    ) {
+        self.bytecode.push((3 << 24) | OP_DP4);
+        self.bytecode
+            .push(Self::encode_register(dest.reg_type, dest.index, dest_mask));
+        self.bytecode
+            .push(Self::encode_register(a.reg_type, a.index, SWIZZLE_XYZW));
+        self.bytecode
+            .push(Self::encode_register(b.reg_type, b.index, SWIZZLE_XYZW));
+    }
+
+    /// mul(v, floatNxM) via N DP4s into dest.xyzw (texture transforms, etc.).
+    fn emit_row_dots(
+        &mut self,
+        dest: &ResolvedRegister,
+        vec: &ResolvedRegister,
+        matrix_base: &ResolvedRegister,
+        rows: u32,
+    ) {
+        let masks = [WRITEMASK_X, WRITEMASK_Y, WRITEMASK_Z, WRITEMASK_W];
+        for i in 0..rows.min(4) {
+            let row = ResolvedRegister {
+                reg_type: matrix_base.reg_type,
+                index: matrix_base.index + i,
+            };
+            self.emit_dp4_masked(dest, vec, &row, masks[i as usize]);
+        }
+    }
+
     /// Map an HLSL output semantic to the SM3 destination register.
     fn map_output_register(
         &self,
@@ -609,14 +682,29 @@ impl Codegen {
                 let dest = self.alloc_temp();
                 match name.as_str() {
                     "mul" if args.len() == 2 => {
+                        // Prefer matrix shape from the *expression* (casts like
+                        // `(float2x4)cBaseTextureTransform`) before falling back
+                        // to register maps / component mul.
+                        let rows_b = self.matrix_rows_of_expr(&args[1]);
+                        let rows_a = self.matrix_rows_of_expr(&args[0]);
                         let a = self.compile_expr(&args[0]);
                         let b = self.compile_expr(&args[1]);
-                        if let Some(rows) = self.is_matrix_const(&b) {
-                            let op = if rows >= 4 { OP_M4X4 } else { OP_M4X3 };
-                            self.emit_instruction(op, &dest, &[a, b]);
-                        } else if let Some(rows) = self.is_matrix_const(&a) {
-                            let op = if rows >= 4 { OP_M4X4 } else { OP_M4X3 };
-                            self.emit_instruction(op, &dest, &[b, a]);
+                        if let Some(rows) = rows_b.or_else(|| self.is_matrix_const(&b)) {
+                            if rows >= 4 {
+                                self.emit_instruction(OP_M4X4, &dest, &[a, b]);
+                            } else if rows == 3 {
+                                self.emit_instruction(OP_M4X3, &dest, &[a, b]);
+                            } else {
+                                self.emit_row_dots(&dest, &a, &b, rows);
+                            }
+                        } else if let Some(rows) = rows_a.or_else(|| self.is_matrix_const(&a)) {
+                            if rows >= 4 {
+                                self.emit_instruction(OP_M4X4, &dest, &[b, a]);
+                            } else if rows == 3 {
+                                self.emit_instruction(OP_M4X3, &dest, &[b, a]);
+                            } else {
+                                self.emit_row_dots(&dest, &b, &a, rows);
+                            }
                         } else {
                             self.emit_instruction(OP_MUL, &dest, &[a, b]);
                         }
